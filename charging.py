@@ -5,12 +5,14 @@ Readings live in data/readings.csv, one row per meter per billing period.
 Rates live in data/rates.csv, effective-dated so a rate change doesn't
 require touching historical data.
 
-  python3 charging.py summary          what's owed, by month
+  python3 charging.py balance          the bottom line: electric less purchases
+  python3 charging.py summary          electricity owed, by month
   python3 charging.py report           every reading, with cost
   python3 charging.py check            validate the data
   python3 charging.py add ...          append a reading
   python3 charging.py import f.txt     backfill several months at once
   python3 charging.py sync e.csv       reconcile against a monitor export
+  python3 charging.py purchase ...     record something bought for the homeowner
 
 Standard library only.
 """
@@ -28,6 +30,7 @@ from pathlib import Path
 DATA_DIR = Path(__file__).resolve().parent / "data"
 READINGS_CSV = DATA_DIR / "readings.csv"
 RATES_CSV = DATA_DIR / "rates.csv"
+PURCHASES_CSV = DATA_DIR / "purchases.csv"
 
 # Every meter that can appear in readings.csv. Adding one here is the only
 # step needed to start tracking a new circuit.
@@ -94,6 +97,23 @@ class Reading:
 
     def __repr__(self):
         return f"Reading({self.start} {self.end} {self.meter} {self.kwh})"
+
+
+class Purchase:
+    """Something bought for the homeowner, which offsets the electricity bill.
+
+    These came from a side column of the original spreadsheet and carry no
+    dates; `date` is None until one is filled in.
+    """
+
+    __slots__ = ("date", "item", "amount", "note", "line")
+
+    def __init__(self, date_, item, amount, note="", line=0):
+        self.date = date_
+        self.item = item
+        self.amount = amount
+        self.note = note
+        self.line = line
 
 
 class Rate:
@@ -165,6 +185,61 @@ def load_rates(path=RATES_CSV):
         raise DataError(f"{path} contains no rates")
     rates.sort(key=lambda r: r.effective_from)
     return rates
+
+
+def load_purchases(path=PURCHASES_CSV):
+    """Purchases made for the homeowner. A missing file simply means none."""
+    if not path.exists():
+        return []
+    purchases = []
+    with path.open(newline="") as handle:
+        for line, row in enumerate(csv.DictReader(handle), start=2):
+            if not any((value or "").strip() for value in row.values()):
+                continue
+            raw = (row.get("amount") or "").strip().replace("$", "").replace(",", "")
+            try:
+                amount = Decimal(raw).quantize(CENT, rounding=ROUND_HALF_UP)
+            except (ArithmeticError, TypeError):
+                raise DataError(
+                    f"{path.name} line {line}: amount {row.get('amount')!r} is not a number"
+                ) from None
+            when = (row.get("date") or "").strip()
+            purchases.append(
+                Purchase(
+                    date_=parse_date(when, "date", line) if when else None,
+                    item=(row.get("item") or "").strip(),
+                    amount=amount,
+                    note=(row.get("note") or "").strip(),
+                    line=line,
+                )
+            )
+    purchases.sort(key=lambda p: (p.date is None, p.date or date.min, p.item))
+    return purchases
+
+
+def write_purchases(purchases, path=None):
+    path = path or PURCHASES_CSV
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(["date", "item", "amount", "note"])
+        for p in purchases:
+            writer.writerow([p.date.isoformat() if p.date else "", p.item,
+                             f"{p.amount:.2f}", p.note])
+
+
+def validate_purchases(purchases):
+    errors, warnings = [], []
+    for p in purchases:
+        where = f"{PURCHASES_CSV.name} line {p.line} ({p.item or 'unnamed'})"
+        if not p.item:
+            errors.append(f"{where}: no item name")
+        if p.amount < 0:
+            errors.append(f"{where}: negative amount ({p.amount})")
+        elif p.amount == 0:
+            warnings.append(f"{where}: zero amount")
+        if p.date is None:
+            warnings.append(f"{where}: no date, so it lands outside any dated range")
+    return errors, warnings
 
 
 def rate_on(rates, day):
@@ -452,8 +527,93 @@ def cmd_report(args, readings, rates):
     return 0
 
 
+def cmd_balance(args, readings, rates):
+    """Electricity owed, less what was bought for the homeowner."""
+    purchases = load_purchases()
+
+    chosen = select(readings, args.year, None, args.since, args.until)
+    dated = [p for p in purchases if p.date is not None]
+    if args.since is not None:
+        dated = [p for p in dated if p.date >= args.since]
+    if args.until is not None:
+        dated = [p for p in dated if p.date <= args.until]
+    if args.year is not None:
+        dated = [p for p in dated if p.date.year == args.year]
+    undated = [p for p in purchases if p.date is None]
+    ranged = args.since is not None or args.until is not None or args.year is not None
+    # Undated purchases can't be placed in a range, so they only count when
+    # the whole history is in view. Otherwise they are reported, not applied.
+    credited = dated if ranged else dated + undated
+
+    kwh, electric = totals(chosen, rates)
+    months = by_month(chosen, rates)
+    span = ""
+    if months:
+        first, last = min(months), max(months)
+        span = (f"{MONTH_NAMES[first[1] - 1]} {first[0]} - "
+                f"{MONTH_NAMES[last[1] - 1]} {last[0]}")
+
+    credit = sum((p.amount for p in credited), Decimal("0"))
+    width = 14
+
+    print("ELECTRICITY")
+    print(f"  {len(months)} month(s), {kwh:,.1f} kWh"
+          f"{'  (' + span + ')' if span else ''}")
+    print(f"  {'owed':<28}{money(electric):>{width}}")
+    print()
+    if credited:
+        print("BOUGHT FOR THE HOMEOWNER")
+        for p in credited:
+            when = p.date.isoformat() if p.date else "no date"
+            print(f"  {p.item:<20}{when:>10}{('-' + money(p.amount)):>{width}}")
+        print(f"  {'credited':<28}{('-' + money(credit)):>{width}}")
+        print()
+    print(f"  {'NET OWED':<28}{money(electric - credit):>{width}}")
+
+    if ranged and undated:
+        print()
+        skipped = sum((p.amount for p in undated), Decimal("0"))
+        print(f"  {len(undated)} undated purchase(s) worth {money(skipped)} are not "
+              f"included in a dated range.")
+        print(f"  Add dates in {PURCHASES_CSV.name} to have them counted here.")
+    return 0
+
+
+def cmd_purchase(args, readings, rates):
+    purchases = load_purchases()
+    when = None
+    if args.date:
+        try:
+            when = date.fromisoformat(args.date)
+        except ValueError:
+            print(f"error: date {args.date!r} is not YYYY-MM-DD", file=sys.stderr)
+            return 2
+    try:
+        amount = Decimal(str(args.amount).replace("$", "").replace(",", "")).quantize(
+            CENT, rounding=ROUND_HALF_UP)
+    except ArithmeticError:
+        print(f"error: amount {args.amount!r} is not a number", file=sys.stderr)
+        return 2
+    if amount <= 0:
+        print("error: amount must be positive", file=sys.stderr)
+        return 2
+
+    new = Purchase(when, args.item, amount, args.note or "")
+    write_purchases(purchases + [new])
+    print(f"Recorded {new.item} {money(amount)}"
+          f"{' on ' + when.isoformat() if when else ' (no date)'}")
+    total = sum((p.amount for p in purchases + [new]), Decimal("0"))
+    print(f"{len(purchases) + 1} purchase(s) credited, {money(total)} total.")
+    return 0
+
+
 def cmd_check(args, readings, rates):
     errors, warnings = validate(readings, rates)
+    try:
+        p_errors, p_warnings = validate_purchases(load_purchases())
+    except DataError as exc:
+        p_errors, p_warnings = [str(exc)], []
+    errors, warnings = errors + p_errors, warnings + p_warnings
     for warning in warnings:
         print(f"WARN  {warning}")
     for error in errors:
@@ -796,6 +956,24 @@ def build_parser():
 
     check = sub.add_parser("check", help="validate the data")
     check.set_defaults(func=cmd_check)
+
+    balance = sub.add_parser(
+        "balance", help="the bottom line: electricity owed less purchases made",
+        description="Nets what is owed for electricity against things bought "
+                    "for the homeowner. Undated purchases count toward the "
+                    "all-time balance but cannot be placed in a dated range.",
+    )
+    balance.add_argument("--year", type=int)
+    balance.add_argument("--since", type=date.fromisoformat, metavar="YYYY-MM-DD")
+    balance.add_argument("--until", type=date.fromisoformat, metavar="YYYY-MM-DD")
+    balance.set_defaults(func=cmd_balance)
+
+    buy = sub.add_parser("purchase", help="record something bought for the homeowner")
+    buy.add_argument("item", help='what it was, e.g. "Home Depot" or "Leaf blower"')
+    buy.add_argument("--amount", required=True, help="dollars, e.g. 217.88")
+    buy.add_argument("--date", metavar="YYYY-MM-DD", help="when, if known")
+    buy.add_argument("--note", default="")
+    buy.set_defaults(func=cmd_purchase)
 
     add = sub.add_parser("add", help="append one reading")
     add.add_argument("--month", metavar="YYYY-MM", help="a whole calendar month")

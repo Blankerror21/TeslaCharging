@@ -724,3 +724,95 @@ class TestReplace(unittest.TestCase):
                                 self.readings, FLAT_RATES)
         self.assertEqual(code, 1)
         self.assertEqual(len(charging.load_readings(self.path)), 2)
+
+
+class TestPurchases(unittest.TestCase):
+    """Things bought for the homeowner, which offset the electricity bill."""
+
+    def _file(self, rows):
+        path = Path(self.tmp.name) / "purchases.csv"
+        path.write_text("date,item,amount,note\n" + "".join(rows))
+        return path
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_loads_dated_and_undated(self):
+        loaded = charging.load_purchases(self._file([
+            "2025-06-14,Home Depot,217.88,\n",
+            ",Leaf blower,120.00,no date\n",
+        ]))
+        self.assertEqual(len(loaded), 2)
+        self.assertEqual(loaded[0].date, date(2025, 6, 14))
+        self.assertIsNone(loaded[1].date)
+        self.assertEqual(loaded[0].amount, Decimal("217.88"))
+
+    def test_amount_is_exact_money(self):
+        loaded = charging.load_purchases(self._file([",Thing,0.1,\n", ",Other,0.2,\n"]))
+        self.assertEqual(sum(p.amount for p in loaded), Decimal("0.30"))
+
+    def test_accepts_dollar_signs_and_separators(self):
+        loaded = charging.load_purchases(self._file([',Mower,"$1,299.99",\n']))
+        self.assertEqual(loaded[0].amount, Decimal("1299.99"))
+
+    def test_undated_sort_last(self):
+        loaded = charging.load_purchases(self._file([
+            ",Zebra,10,\n", "2025-01-01,Anvil,10,\n",
+        ]))
+        self.assertEqual([p.item for p in loaded], ["Anvil", "Zebra"])
+
+    def test_missing_file_means_no_purchases(self):
+        self.assertEqual(charging.load_purchases(Path("/nonexistent/purchases.csv")), [])
+
+    def test_bad_amount_names_the_line(self):
+        with self.assertRaises(DataError) as caught:
+            charging.load_purchases(self._file([",Thing,free,\n"]))
+        self.assertIn("line 2", str(caught.exception))
+
+    def test_validation_flags_the_things_that_matter(self):
+        loaded = charging.load_purchases(self._file([
+            ",,50,\n",            # no item name
+            "2025-01-01,Bad,-5,\n",
+            ",Undated,10,\n",
+        ]))
+        errors, warnings = charging.validate_purchases(loaded)
+        self.assertTrue(any("no item name" in e for e in errors))
+        self.assertTrue(any("negative amount" in e for e in errors))
+        self.assertTrue(any("no date" in w for w in warnings))
+
+    def test_round_trips_through_a_write(self):
+        original = charging.load_purchases(self._file([
+            "2025-06-14,Home Depot,217.88,receipt in glovebox\n",
+            ",Leaf blower,120.00,\n",
+        ]))
+        out = Path(self.tmp.name) / "again.csv"
+        charging.write_purchases(original, out)
+        again = charging.load_purchases(out)
+        self.assertEqual([(p.date, p.item, p.amount, p.note) for p in again],
+                         [(p.date, p.item, p.amount, p.note) for p in original])
+
+
+class TestRealPurchases(unittest.TestCase):
+    """The three entries recovered from the spreadsheet's side column."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.purchases = charging.load_purchases()
+
+    def test_all_three_are_present(self):
+        self.assertEqual(sorted(p.item for p in self.purchases),
+                         ["Harbor freight", "Home Depot", "Leaf blower"])
+
+    def test_total_includes_the_leaf_blower(self):
+        # The sheet's own Total cell was =J31+J32, which stopped above the
+        # leaf blower and read $437.87.
+        total = sum((p.amount for p in self.purchases), Decimal("0"))
+        self.assertEqual(total, Decimal("557.87"))
+        self.assertNotEqual(total, Decimal("437.87"))
+
+    def test_net_is_electricity_less_purchases(self):
+        readings, rates = charging.load_readings(), charging.load_rates()
+        _, electric = charging.totals(readings, rates)
+        credit = sum((p.amount for p in self.purchases), Decimal("0"))
+        self.assertEqual(electric - credit, Decimal("5043.35"))

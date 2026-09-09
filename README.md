@@ -11,7 +11,8 @@ Python 3.9+, standard library only. Nothing to install.
 ## Usage
 
 ```
-python3 charging.py summary     # what's owed, by month
+python3 charging.py balance     # the bottom line: electricity less purchases
+python3 charging.py summary     # electricity owed, by month
 python3 charging.py report      # every reading, with its cost
 python3 charging.py check       # validate the data
 ```
@@ -85,6 +86,18 @@ first and writes nothing if any line is bad. `--force` overrides. Editing
 Two periods on the same meter may share a boundary date — one meter read
 closes a period and opens the next. Different meters covering the same days
 is expected and not an error.
+
+**`data/purchases.csv`** — `date,item,amount,note`, one row per thing bought
+for the homeowner. These offset the electricity bill, so `balance` subtracts
+them:
+
+```
+python3 charging.py purchase "Home Depot" --amount 217.88 --date 2025-06-14
+```
+
+`date` may be blank. An undated purchase still counts toward the all-time
+balance, but it can't be placed inside a date range — `balance --since ...`
+reports it separately rather than silently dropping or double-counting it.
 
 **`data/rates.csv`** — `effective_from,usd_per_kwh,note`, one row per rate
 change. A period is billed at the rate in effect on its **end** date, the day
@@ -178,11 +191,16 @@ for provenance. Two things were changed on the way in:
 - **One empty row dropped.** Row 35 (`10/1/25 - 10/30/25`) had no kWh recorded
   but its formulas still produced a $133.09 charge. It's simply absent until a
   reading is entered.
+- **The side column became `purchases.csv`.** Cells I31:J35 held Home Depot,
+  Harbor Freight and a leaf blower — things bought for the homeowner, which
+  offset the bill. Its `Total` cell was `=J31+J32`, stopping above the leaf
+  blower and reading $437.87 against an actual $557.87.
 
 Everything else came across as-is, including a February 2025 overlap, which
 was later resolved by the export reconciliation described above.
 
 ### The bug that motivated this
+
 
 In the sheet, the total-cost and total-kWh columns used `=E<n-14>+E<n>`. That
 offset was correct while the upstairs "Electric usage" block had rows to point
