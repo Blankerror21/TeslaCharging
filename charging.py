@@ -64,14 +64,18 @@ def month_bounds(text):
 
 
 class Reading:
-    __slots__ = ("start", "end", "meter", "kwh", "note", "line")
+    __slots__ = ("start", "end", "meter", "kwh", "note", "estimated", "line")
 
-    def __init__(self, start, end, meter, kwh, note="", line=0):
+    def __init__(self, start, end, meter, kwh, note="", estimated=False, line=0):
         self.start = start
         self.end = end
         self.meter = meter
         self.kwh = kwh
         self.note = note
+        # True when the figure was reconstructed rather than metered -- the
+        # charger being offline, say. Someone is paid off these numbers, so
+        # an estimate has to stay visibly an estimate.
+        self.estimated = estimated
         self.line = line
 
     @property
@@ -127,6 +131,8 @@ def load_readings(path=READINGS_CSV):
                     meter=(row["meter"] or "").strip(),
                     kwh=kwh,
                     note=(row.get("note") or "").strip(),
+                    estimated=(row.get("estimated") or "").strip().lower()
+                    in ("yes", "true", "1", "y"),
                     line=line,
                 )
             )
@@ -221,12 +227,14 @@ def billing_month(reading):
 
 def by_month(readings, rates):
     """Group readings by billing month. See billing_month for the rule."""
-    months = defaultdict(lambda: {"kwh": 0.0, "cost": Decimal("0"), "meters": defaultdict(float)})
+    months = defaultdict(lambda: {"kwh": 0.0, "cost": Decimal("0"),
+                                  "meters": defaultdict(float), "estimated": False})
     for reading in readings:
         bucket = months[billing_month(reading)]
         bucket["kwh"] += reading.kwh
         bucket["cost"] += reading.cost(rates)
         bucket["meters"][reading.meter] += reading.kwh
+        bucket["estimated"] = bucket["estimated"] or reading.estimated
     return dict(sorted(months.items()))
 
 
@@ -270,6 +278,8 @@ def validate(readings, rates):
             errors.append(f"{where}: unknown meter {reading.meter!r}; expected one of {', '.join(METERS)}")
         if reading.end < reading.start:
             errors.append(f"{where}: end date is before start date")
+        if reading.estimated:
+            warnings.append(f"{where}: estimated, not metered ({reading.kwh:,.1f} kWh)")
         if reading.kwh < 0:
             errors.append(f"{where}: negative kWh ({reading.kwh})")
         elif reading.kwh == 0:
@@ -385,7 +395,7 @@ def cmd_summary(args, readings, rates):
     aligns = ["left"] + ["right"] * (len(meters) + 2)
     rows = []
     for (year, month), bucket in months.items():
-        row = [f"{MONTH_NAMES[month - 1]} {year}"]
+        row = [f"{MONTH_NAMES[month - 1]} {year}" + (" *" if bucket["estimated"] else "")]
         for meter in meters:
             value = bucket["meters"].get(meter)
             row.append(f"{value:,.1f}" if value else "-")
@@ -398,6 +408,11 @@ def cmd_summary(args, readings, rates):
     kwh, cost = totals(chosen, rates)
     print()
     print(f"{len(months)} month(s), {kwh:,.1f} kWh, {money(cost)} owed")
+    estimated = [r for r in chosen if r.estimated]
+    if estimated:
+        est_kwh, est_cost = totals(estimated, rates)
+        print(f"  * {len(estimated)} estimated reading(s): {est_kwh:,.1f} kWh, "
+              f"{money(est_cost)} of the above is not metered")
     if len(meters) > 1:
         print()
         print("By meter:")
@@ -414,8 +429,8 @@ def cmd_report(args, readings, rates):
         print("No readings match that filter.")
         return 0
 
-    headers = ["Start", "End", "Days", "Meter", "kWh", "Rate", "Cost"]
-    aligns = ["left", "left", "right", "left", "right", "right", "right"]
+    headers = ["Start", "End", "Days", "Meter", "kWh", "Rate", "Cost", ""]
+    aligns = ["left", "left", "right", "left", "right", "right", "right", "left"]
     rows = [
         [
             r.start.isoformat(),
@@ -425,6 +440,7 @@ def cmd_report(args, readings, rates):
             f"{r.kwh:,.2f}",
             f"${rate_on(rates, r.end):.4f}".rstrip("0").rstrip("."),
             money(r.cost(rates)),
+            "estimated" if r.estimated else "",
         ]
         for r in chosen
     ]
@@ -465,6 +481,7 @@ def append_readings(new, readings, rates, force=False):
             writer.writerow([
                 reading.start.isoformat(), reading.end.isoformat(),
                 reading.meter, f"{reading.kwh:g}", reading.note,
+                "yes" if reading.estimated else "",
             ])
     return []
 
@@ -493,7 +510,7 @@ def cmd_add(args, readings, rates):
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    new = Reading(start, end, args.meter, args.kwh, args.note or "")
+    new = Reading(start, end, args.meter, args.kwh, args.note or "", args.estimated)
     introduced = append_readings([new], readings, rates, args.force)
     if introduced:
         print("Refusing to add -- this reading would break the data:", file=sys.stderr)
@@ -506,7 +523,7 @@ def cmd_add(args, readings, rates):
     return 0
 
 
-def parse_backfill(lines, default_meter=DEFAULT_METER):
+def parse_backfill(lines, default_meter=DEFAULT_METER, estimated=False):
     """Parse `YYYY-MM  kwh  [meter]` lines. Blank lines and # comments ignored."""
     parsed = []
     for number, raw in enumerate(lines, start=1):
@@ -530,7 +547,7 @@ def parse_backfill(lines, default_meter=DEFAULT_METER):
         meter = fields[2] if len(fields) == 3 else default_meter
         if meter not in METERS:
             raise DataError(f"line {number}: unknown meter {meter!r}")
-        parsed.append(Reading(start, end, meter, kwh))
+        parsed.append(Reading(start, end, meter, kwh, estimated=estimated))
     return parsed
 
 
@@ -540,10 +557,10 @@ def write_readings(readings, path=None):
     ordered = sorted(readings, key=lambda r: (r.start, r.end, r.meter))
     with path.open("w", newline="") as handle:
         writer = csv.writer(handle, lineterminator="\n")
-        writer.writerow(["start", "end", "meter", "kwh", "note"])
+        writer.writerow(["start", "end", "meter", "kwh", "note", "estimated"])
         for r in ordered:
             writer.writerow([r.start.isoformat(), r.end.isoformat(), r.meter,
-                             f"{r.kwh:g}", r.note])
+                             f"{r.kwh:g}", r.note, "yes" if r.estimated else ""])
 
 
 def parse_export(lines):
@@ -588,11 +605,14 @@ def parse_export(lines):
     return monthly
 
 
-def plan_sync(monthly, readings, meter, today=None):
+def plan_sync(monthly, readings, meter, today=None, replace_estimates=False):
     """Work out what syncing an export would change.
 
-    Returns (adds, updates, unchanged, skipped). A month still in progress is
-    skipped -- its total is partial and would read as a low outlier.
+    Returns (adds, updates, unchanged, skipped, held). A month still in
+    progress is skipped -- its total is partial and would read as a low
+    outlier. An estimated reading is held rather than overwritten: the
+    estimate exists because the export was missing that energy, so letting
+    the same export quietly undo it would walk the number back every sync.
     """
     today = today or date.today()
     existing = {}
@@ -600,7 +620,7 @@ def plan_sync(monthly, readings, meter, today=None):
         if reading.meter == meter:
             existing.setdefault(billing_month(reading), []).append(reading)
 
-    adds, updates, unchanged, skipped = [], [], [], []
+    adds, updates, unchanged, skipped, held = [], [], [], [], []
     for key in sorted(monthly):
         start, end = month_bounds(f"{key[0]}-{key[1]:02d}")
         kwh = monthly[key]
@@ -619,9 +639,11 @@ def plan_sync(monthly, readings, meter, today=None):
             was = current[0]
             if abs(was.kwh - kwh) < 0.05 and (was.start, was.end) == (start, end):
                 unchanged.append(was)
+            elif was.estimated and not replace_estimates:
+                held.append((was, kwh))
             else:
                 updates.append((was, Reading(start, end, meter, kwh, was.note)))
-    return adds, updates, unchanged, skipped
+    return adds, updates, unchanged, skipped, held
 
 
 def cmd_sync(args, readings, rates):
@@ -630,13 +652,17 @@ def cmd_sync(args, readings, rates):
         lines = handle.readlines()
     try:
         monthly = parse_export(lines)
-        adds, updates, unchanged, skipped = plan_sync(monthly, readings, args.meter)
+        adds, updates, unchanged, skipped, held = plan_sync(
+            monthly, readings, args.meter, replace_estimates=args.replace_estimates)
     except DataError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
     for key, kwh in skipped:
         print(f"  skip    {key[0]}-{key[1]:02d}  {kwh:>8,.1f} kWh  (month still in progress)")
+    for was, kwh in held:
+        print(f"  hold    {was.start:%Y-%m}  export says {kwh:,.1f}, keeping the "
+              f"{was.kwh:,.1f} kWh estimate  (--replace-estimates to take the export)")
     for was, now in updates:
         delta = now.kwh - was.kwh
         moved = "" if (was.start, was.end) == (now.start, now.end) else \
@@ -686,7 +712,7 @@ def cmd_import(args, readings, rates):
             source.close()
 
     try:
-        new = parse_backfill(lines, args.meter)
+        new = parse_backfill(lines, args.meter, args.estimated)
     except DataError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -752,6 +778,8 @@ def build_parser():
     add.add_argument("--meter", choices=METERS, default=DEFAULT_METER)
     add.add_argument("--kwh", required=True, type=float)
     add.add_argument("--note", default="")
+    add.add_argument("--estimated", action="store_true",
+                     help="mark as reconstructed rather than metered")
     add.add_argument("--force", action="store_true", help="add even if it breaks validation")
     add.set_defaults(func=cmd_add)
 
@@ -764,6 +792,8 @@ def build_parser():
     imp.add_argument("file", nargs="?", help="input file (default: stdin)")
     imp.add_argument("--meter", choices=METERS, default=DEFAULT_METER,
                      help="meter for lines that don't name one")
+    imp.add_argument("--estimated", action="store_true",
+                     help="mark these as reconstructed rather than metered")
     imp.add_argument("--force", action="store_true", help="import even if it breaks validation")
     imp.set_defaults(func=cmd_import)
 
@@ -776,6 +806,8 @@ def build_parser():
     )
     sync.add_argument("file", help="exported CSV: a date column and a kWh/MWh column")
     sync.add_argument("--meter", choices=METERS, default=DEFAULT_METER)
+    sync.add_argument("--replace-estimates", action="store_true",
+                      help="let the export overwrite readings marked estimated")
     sync.add_argument("--apply", action="store_true", help="actually write the changes")
     sync.set_defaults(func=cmd_sync)
 

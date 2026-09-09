@@ -522,28 +522,28 @@ class TestPlanSync(unittest.TestCase):
     TODAY = date(2026, 9, 9)
 
     def test_adds_months_the_tracker_lacks(self):
-        adds, updates, unchanged, skipped = charging.plan_sync(
+        adds, updates, unchanged, skipped, _ = charging.plan_sync(
             {(2026, 1): 289.4}, [], "wall_connector", today=self.TODAY)
         self.assertEqual(len(adds), 1)
         self.assertEqual((adds[0].start, adds[0].end), (date(2026, 1, 1), date(2026, 1, 31)))
         self.assertEqual((updates, unchanged, skipped), ([], [], []))
 
     def test_skips_a_month_still_in_progress(self):
-        adds, _, _, skipped = charging.plan_sync(
+        adds, _, _, skipped, _ = charging.plan_sync(
             {(2026, 9): 157.7}, [], "wall_connector", today=self.TODAY)
         self.assertEqual(adds, [])
         self.assertEqual(skipped, [((2026, 9), 157.7)])
 
     def test_matching_month_is_left_alone(self):
         existing = [reading("2026-01-01", "2026-01-31", kwh=289.4, line=2)]
-        adds, updates, unchanged, _ = charging.plan_sync(
+        adds, updates, unchanged, _, _ = charging.plan_sync(
             {(2026, 1): 289.4}, existing, "wall_connector", today=self.TODAY)
         self.assertEqual((adds, updates), ([], []))
         self.assertEqual(len(unchanged), 1)
 
     def test_differing_value_becomes_an_update(self):
         existing = [reading("2025-08-01", "2025-08-31", kwh=572.5, line=2)]
-        _, updates, _, _ = charging.plan_sync(
+        _, updates, _, _, _ = charging.plan_sync(
             {(2025, 8): 583.9}, existing, "wall_connector", today=self.TODAY)
         self.assertEqual(len(updates), 1)
         was, now = updates[0]
@@ -552,7 +552,7 @@ class TestPlanSync(unittest.TestCase):
     def test_loose_dates_are_normalised_even_when_the_value_matches(self):
         # The sheet's "1/4/25 - 2/4/25" held January's figure exactly.
         existing = [reading("2025-01-04", "2025-02-04", kwh=648.2, line=2)]
-        _, updates, unchanged, _ = charging.plan_sync(
+        _, updates, unchanged, _, _ = charging.plan_sync(
             {(2025, 1): 648.2}, existing, "wall_connector", today=self.TODAY)
         self.assertEqual(unchanged, [])
         was, now = updates[0]
@@ -561,7 +561,7 @@ class TestPlanSync(unittest.TestCase):
 
     def test_other_meters_are_untouched(self):
         existing = [reading("2025-08-01", "2025-08-31", meter="meter_240v", kwh=1.0, line=2)]
-        adds, updates, _, _ = charging.plan_sync(
+        adds, updates, _, _, _ = charging.plan_sync(
             {(2025, 8): 583.9}, existing, "wall_connector", today=self.TODAY)
         self.assertEqual(len(adds), 1)
         self.assertEqual(updates, [])
@@ -609,3 +609,62 @@ class TestSyncedData(unittest.TestCase):
         for earlier, later in zip(ordered, ordered[1:]):
             expected = (earlier[0] + 1, 1) if earlier[1] == 12 else (earlier[0], earlier[1] + 1)
             self.assertEqual(later, expected, f"gap after {earlier}")
+
+
+class TestEstimatedReadings(unittest.TestCase):
+    TODAY = date(2026, 9, 9)
+
+    def test_an_estimate_is_held_against_the_export_that_missed_it(self):
+        existing = [Reading(date(2026, 1, 1), date(2026, 1, 31), "wall_connector",
+                            635.0, estimated=True, line=2)]
+        adds, updates, _, _, held = charging.plan_sync(
+            {(2026, 1): 289.4}, existing, "wall_connector", today=self.TODAY)
+        self.assertEqual((adds, updates), ([], []))
+        self.assertEqual(len(held), 1)
+        self.assertEqual(held[0][1], 289.4)
+
+    def test_replace_estimates_takes_the_export(self):
+        existing = [Reading(date(2026, 1, 1), date(2026, 1, 31), "wall_connector",
+                            635.0, estimated=True, line=2)]
+        _, updates, _, _, held = charging.plan_sync(
+            {(2026, 1): 289.4}, existing, "wall_connector", today=self.TODAY,
+            replace_estimates=True)
+        self.assertEqual(held, [])
+        self.assertEqual(len(updates), 1)
+        self.assertFalse(updates[0][1].estimated, "a synced figure is metered, not estimated")
+
+    def test_a_backfilled_export_still_needs_the_flag(self):
+        # Even a higher figure is held -- taking it is an explicit choice.
+        existing = [Reading(date(2026, 1, 1), date(2026, 1, 31), "wall_connector",
+                            635.0, estimated=True, line=2)]
+        _, updates, _, _, held = charging.plan_sync(
+            {(2026, 1): 648.0}, existing, "wall_connector", today=self.TODAY)
+        self.assertEqual(updates, [])
+        self.assertEqual(len(held), 1)
+
+    def test_check_keeps_estimates_visible(self):
+        estimate = Reading(date(2026, 1, 1), date(2026, 1, 31), "wall_connector",
+                           635.0, estimated=True, line=2)
+        _, warnings = validate([estimate], FLAT_RATES)
+        self.assertTrue(any("estimated, not metered" in w for w in warnings))
+
+    def test_estimated_survives_a_write_and_reload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "readings.csv"
+            charging.write_readings([
+                Reading(date(2026, 1, 1), date(2026, 1, 31), "wall_connector", 635.0,
+                        note="outage", estimated=True),
+                Reading(date(2026, 2, 1), date(2026, 2, 28), "wall_connector", 607.9),
+            ], path)
+            loaded = charging.load_readings(path)
+        self.assertTrue(loaded[0].estimated)
+        self.assertEqual(loaded[0].note, "outage")
+        self.assertFalse(loaded[1].estimated)
+
+    def test_old_files_without_the_column_still_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "readings.csv"
+            path.write_text("start,end,meter,kwh,note\n"
+                            "2026-01-01,2026-01-31,wall_connector,635,\n")
+            loaded = charging.load_readings(path)
+        self.assertFalse(loaded[0].estimated)

@@ -80,6 +80,7 @@ first and writes nothing if any line is bad. `--force` overrides. Editing
 | `meter` | `meter_120v`, `meter_240v`, or `wall_connector` (below)    |
 | `kwh`   | kWh used over the period                                   |
 | `note`  | free text, optional                                        |
+| `estimated` | `yes` if the figure was reconstructed, not metered      |
 
 Two periods on the same meter may share a boundary date — one meter read
 closes a period and opens the next. Different meters covering the same days
@@ -117,11 +118,38 @@ median — the usual shape of a transposed digit.
 
 `check` exits non-zero if there are errors.
 
+## Estimated readings
+
+If the charger drops offline, its usage can go missing from the export. A
+figure reconstructed to cover that is recorded with `estimated` set, because
+someone is paid off these numbers and an estimate has to stay visibly an
+estimate:
+
+```
+python3 charging.py add --month 2026-01 --kwh 635 --estimated \
+    --note "charger offline; from the yearly rollup"
+```
+
+`summary` marks those months with `*` and reports how much of the total isn't
+metered, `report` labels the row, and `check` warns about them every run.
+
+`sync` will not overwrite an estimated reading. The estimate usually exists
+*because* the export was missing that energy, so letting the same export undo
+it would walk the number back on every sync. It reports the month as held and
+shows what the export claims; `--replace-estimates` takes the export's figure
+and clears the flag, which is what you want once a gap has genuinely
+backfilled.
+
 ## Where the numbers come from
 
 Readings originally came from the spreadsheet, hand-typed each month from the
 energy monitor. From October 2025 they come from the monitor's export via
 `sync`, and 2025's earlier months have been reconciled against it.
+
+Cross-checking the two views is worth doing when a gap is suspected: for 2025
+the monthly rows sum to 7,084.7 kWh against a 7,100 kWh yearly rollup, which
+agrees inside the rollup's rounding. For 2026 they sum to 4,554.1 against
+4,900 -- roughly 346 kWh the monthly breakdown never accounted for.
 
 That reconciliation confirmed what the sheet's dates really meant. January,
 February and March 2025 matched the export *exactly* -- including January,
