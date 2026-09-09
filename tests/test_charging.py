@@ -3,6 +3,7 @@
 import csv
 import sys
 import tempfile
+from collections import defaultdict
 import unittest
 from datetime import date
 from decimal import Decimal
@@ -179,7 +180,7 @@ class TestValidate(unittest.TestCase):
                     for m in range(1, 6)]
         readings.append(reading("2025-06-01", "2025-06-28", kwh=6000.0, line=6))
         _, warnings = validate(readings, FLAT_RATES)
-        self.assertTrue(any("kWh/day vs a typical" in w for w in warnings))
+        self.assertTrue(any("kWh/day, high against" in w for w in warnings))
 
     def test_outlier_needs_enough_history_to_judge(self):
         readings = [
@@ -253,12 +254,15 @@ class TestLoading(unittest.TestCase):
             charging.load_readings(Path("/nonexistent/readings.csv"))
 
 
-class TestRealData(unittest.TestCase):
-    """Locks in the figures the original spreadsheet's formulas got wrong.
+class TestNoCrossContamination(unittest.TestCase):
+    """The invariant the original spreadsheet broke.
 
-    Rows 32-35 of the sheet referenced cells 14 rows up, which fell inside
-    the wall-connector block itself once the upstairs block ran out, adding
-    2024 costs onto 2025 months.
+    Its total columns used =E<n-14>+E<n>. Once the upstairs block ran out of
+    rows, that offset reached back into the wall-connector block itself, so a
+    2025 month was billed partly for 2024 usage. Pinning the corrected dollar
+    figures would only be a snapshot -- they legitimately move when a monitor
+    export supersedes a hand-typed reading. The property worth holding forever
+    is that a month's cost depends on nothing but its own readings.
     """
 
     @classmethod
@@ -267,31 +271,40 @@ class TestRealData(unittest.TestCase):
         cls.rates = charging.load_rates()
         cls.months = charging.by_month(cls.readings, cls.rates)
 
-    def test_july_2025_excludes_the_may_2024_reading(self):
-        # Sheet showed $155.61 -- $36.22 of that was 5/26-5/30/2024.
-        self.assertEqual(self.months[(2025, 7)]["cost"], Decimal("119.39"))
+    def test_each_month_costs_exactly_its_own_readings(self):
+        owned = defaultdict(list)
+        for r in self.readings:
+            owned[billing_month(r)].append(r)
+        for key, bucket in self.months.items():
+            expected = sum((r.cost(self.rates) for r in owned[key]), Decimal("0"))
+            with self.subTest(month=f"{key[0]}-{key[1]:02d}"):
+                self.assertEqual(bucket["cost"], expected)
+                self.assertAlmostEqual(bucket["kwh"], sum(r.kwh for r in owned[key]), places=6)
 
-    def test_september_2025_excludes_the_july_2024_reading(self):
-        # Sheet showed $258.80 -- $150.46 of that was July 2024.
-        self.assertEqual(self.months[(2025, 9)]["cost"], Decimal("108.34"))
+    def test_dropping_one_reading_moves_only_its_own_month(self):
+        victim = next(r for r in self.readings
+                      if r.meter == "wall_connector" and billing_month(r) == (2025, 7))
+        without = charging.by_month([r for r in self.readings if r is not victim], self.rates)
+        for key, bucket in self.months.items():
+            if key == (2025, 7):
+                continue
+            with self.subTest(month=f"{key[0]}-{key[1]:02d}"):
+                self.assertEqual(without[key]["cost"], bucket["cost"])
+        # July 2025 holds only this reading, so the month goes away entirely.
+        self.assertNotIn((2025, 7), without)
 
-    def test_august_2025_is_present(self):
-        # The sheet had no total-cost formula in this row at all.
-        self.assertEqual(self.months[(2025, 8)]["cost"], Decimal("103.05"))
+    def test_every_reading_lands_in_exactly_one_year(self):
+        counted = sum(len(charging.select(self.readings, year=y)) for y in (2024, 2025, 2026))
+        self.assertEqual(counted, len(self.readings))
 
     def test_the_120v_mining_meter_stopped_in_march_2025(self):
         # The rig was shut off; only the wall connector runs after this.
         latest = max(r.end for r in self.readings if r.meter == "meter_120v")
         self.assertEqual(latest, date(2025, 3, 8))
 
-    def test_months_the_sheet_got_right_are_unchanged(self):
-        for (year, month), expected in {
-            (2024, 5): "502.58", (2024, 6): "479.00", (2024, 7): "532.56",
-            (2024, 11): "323.62", (2025, 1): "256.31", (2025, 2): "101.97",
-            (2025, 6): "111.08",
-        }.items():
-            with self.subTest(month=f"{year}-{month:02d}"):
-                self.assertEqual(self.months[(year, month)]["cost"], Decimal(expected))
+
+class TestYearFilterMatchesGrouping(unittest.TestCase):
+    """--year must agree with the month a period is billed to."""
 
     def test_period_straddling_new_year_belongs_to_the_earlier_year(self):
         readings = [reading("2024-12-02", "2025-01-04", kwh=655.9, line=2)]
@@ -301,9 +314,9 @@ class TestRealData(unittest.TestCase):
     def test_real_data_summary_and_year_filter_agree(self):
         readings = charging.load_readings()
         rates = charging.load_rates()
-        for year in (2024, 2025):
+        for year in (2024, 2025, 2026):
             months = charging.by_month(charging.select(readings, year=year), rates)
-            self.assertTrue(months)
+            self.assertTrue(months, f"no months for {year}")
             self.assertTrue(all(m[0] == year for m in months), f"{year}: {sorted(months)}")
 
 
@@ -437,3 +450,162 @@ class TestAppendReadings(unittest.TestCase):
         new = charging.parse_backfill(["2025-02 580", "2025-02 590"])
         self.assertTrue(charging.append_readings(new, self.existing, FLAT_RATES))
         self.assertEqual(len(charging.load_readings(self.path)), 1)
+
+
+class TestLowOutlier(unittest.TestCase):
+    """A partial month recorded as a whole one reads as an unusually low month."""
+
+    def _months(self, *kwh):
+        import calendar as _cal
+        return [reading(f"2025-{i:02d}-01",
+                        f"2025-{i:02d}-{_cal.monthrange(2025, i)[1]}", kwh=v, line=i)
+                for i, v in enumerate(kwh, start=1)]
+
+    def test_flags_a_partial_month_recorded_as_whole(self):
+        _, warnings = validate(self._months(600, 610, 590, 620, 605, 60), FLAT_RATES)
+        self.assertTrue(any("low against a typical" in w for w in warnings))
+
+    def test_still_flags_a_high_outlier(self):
+        _, warnings = validate(self._months(600, 610, 590, 620, 605, 6000), FLAT_RATES)
+        self.assertTrue(any("high against a typical" in w for w in warnings))
+
+    def test_ordinary_variation_is_not_flagged(self):
+        _, warnings = validate(self._months(600, 610, 590, 620, 605, 470), FLAT_RATES)
+        self.assertEqual(warnings, [])
+
+
+class TestParseExport(unittest.TestCase):
+    def test_kwh_export(self):
+        parsed = charging.parse_export([
+            "Date time,Vehicle (kWh)",
+            "2025-10-01T00:00:00-07:00,470.4",
+            "2025-11-01T00:00:00-08:00,517.0",
+        ])
+        self.assertEqual(parsed, {(2025, 10): 470.4, (2025, 11): 517.0})
+
+    def test_mwh_is_scaled_to_kwh(self):
+        parsed = charging.parse_export([
+            "Date time,Vehicle (MWh)",
+            "2025-10-01T00:00:00-07:00,5.2",
+        ])
+        self.assertEqual(parsed, {(2025, 10): 5200.0})
+
+    def test_rejects_a_yearly_export(self):
+        # Yearly rows are also dated the 1st, but of January only -- the give
+        # away is that they can't fill a monthly tracker. A daily export is
+        # what the day check really catches.
+        with self.assertRaises(DataError) as caught:
+            charging.parse_export([
+                "Date time,Vehicle (kWh)",
+                "2025-01-15T00:00:00-08:00,470.4",
+            ])
+        self.assertIn("isn't the first of a month", str(caught.exception))
+
+    def test_rejects_an_unknown_unit(self):
+        with self.assertRaises(DataError):
+            charging.parse_export(["Date time,Vehicle (therms)", "2025-10-01,470.4"])
+
+    def test_rejects_empty_and_headerless(self):
+        with self.assertRaises(DataError):
+            charging.parse_export([])
+        with self.assertRaises(DataError):
+            charging.parse_export(["Date time,Vehicle (kWh)"])
+
+    def test_blank_rows_are_skipped(self):
+        parsed = charging.parse_export([
+            "Date time,Vehicle (kWh)", "2025-10-01,470.4", ",", "",
+        ])
+        self.assertEqual(len(parsed), 1)
+
+
+class TestPlanSync(unittest.TestCase):
+    TODAY = date(2026, 9, 9)
+
+    def test_adds_months_the_tracker_lacks(self):
+        adds, updates, unchanged, skipped = charging.plan_sync(
+            {(2026, 1): 289.4}, [], "wall_connector", today=self.TODAY)
+        self.assertEqual(len(adds), 1)
+        self.assertEqual((adds[0].start, adds[0].end), (date(2026, 1, 1), date(2026, 1, 31)))
+        self.assertEqual((updates, unchanged, skipped), ([], [], []))
+
+    def test_skips_a_month_still_in_progress(self):
+        adds, _, _, skipped = charging.plan_sync(
+            {(2026, 9): 157.7}, [], "wall_connector", today=self.TODAY)
+        self.assertEqual(adds, [])
+        self.assertEqual(skipped, [((2026, 9), 157.7)])
+
+    def test_matching_month_is_left_alone(self):
+        existing = [reading("2026-01-01", "2026-01-31", kwh=289.4, line=2)]
+        adds, updates, unchanged, _ = charging.plan_sync(
+            {(2026, 1): 289.4}, existing, "wall_connector", today=self.TODAY)
+        self.assertEqual((adds, updates), ([], []))
+        self.assertEqual(len(unchanged), 1)
+
+    def test_differing_value_becomes_an_update(self):
+        existing = [reading("2025-08-01", "2025-08-31", kwh=572.5, line=2)]
+        _, updates, _, _ = charging.plan_sync(
+            {(2025, 8): 583.9}, existing, "wall_connector", today=self.TODAY)
+        self.assertEqual(len(updates), 1)
+        was, now = updates[0]
+        self.assertEqual((was.kwh, now.kwh), (572.5, 583.9))
+
+    def test_loose_dates_are_normalised_even_when_the_value_matches(self):
+        # The sheet's "1/4/25 - 2/4/25" held January's figure exactly.
+        existing = [reading("2025-01-04", "2025-02-04", kwh=648.2, line=2)]
+        _, updates, unchanged, _ = charging.plan_sync(
+            {(2025, 1): 648.2}, existing, "wall_connector", today=self.TODAY)
+        self.assertEqual(unchanged, [])
+        was, now = updates[0]
+        self.assertEqual((now.start, now.end), (date(2025, 1, 1), date(2025, 1, 31)))
+        self.assertEqual(now.kwh, was.kwh)
+
+    def test_other_meters_are_untouched(self):
+        existing = [reading("2025-08-01", "2025-08-31", meter="meter_240v", kwh=1.0, line=2)]
+        adds, updates, _, _ = charging.plan_sync(
+            {(2025, 8): 583.9}, existing, "wall_connector", today=self.TODAY)
+        self.assertEqual(len(adds), 1)
+        self.assertEqual(updates, [])
+
+    def test_ambiguous_month_is_refused(self):
+        existing = [
+            reading("2025-08-01", "2025-08-15", kwh=300.0, line=2),
+            reading("2025-08-16", "2025-08-31", kwh=283.9, line=3),
+        ]
+        with self.assertRaises(DataError):
+            charging.plan_sync({(2025, 8): 583.9}, existing, "wall_connector",
+                               today=self.TODAY)
+
+
+class TestSyncedData(unittest.TestCase):
+    """The tracker now reflects the monitor exports."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.readings = charging.load_readings()
+        cls.rates = charging.load_rates()
+        cls.months = charging.by_month(cls.readings, cls.rates)
+
+    def test_no_errors(self):
+        errors, _ = validate(self.readings, self.rates)
+        self.assertEqual(errors, [], "\n".join(errors))
+
+    def test_wall_connector_months_are_whole_calendar_months(self):
+        import calendar as _cal
+        for r in (r for r in self.readings if r.meter == "wall_connector"):
+            if r.start < date(2024, 6, 1):
+                continue  # the connector was installed partway through May 2024
+            with self.subTest(period=f"{r.start}..{r.end}"):
+                self.assertEqual(r.start.day, 1)
+                self.assertEqual(r.end.day, _cal.monthrange(r.end.year, r.end.month)[1])
+                self.assertEqual((r.start.year, r.start.month), (r.end.year, r.end.month))
+
+    def test_september_2026_is_not_recorded_while_in_progress(self):
+        self.assertNotIn((2026, 9), self.months)
+
+    def test_coverage_runs_unbroken_to_august_2026(self):
+        ordered = sorted(self.months)
+        self.assertEqual(ordered[0], (2024, 4))
+        self.assertEqual(ordered[-1], (2026, 8))
+        for earlier, later in zip(ordered, ordered[1:]):
+            expected = (earlier[0] + 1, 1) if earlier[1] == 12 else (earlier[0], earlier[1] + 1)
+            self.assertEqual(later, expected, f"gap after {earlier}")

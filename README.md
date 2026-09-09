@@ -29,7 +29,27 @@ That's the whole monthly ritual. `--meter` defaults to `wall_connector`, the
 only meter still running; `--month` expands to the first and last day of that
 month. For a period that isn't a calendar month, use `--start` and `--end`.
 
-### Catching up on several months
+### Syncing from the energy monitor
+
+The monitor's own monthly export is the authoritative source, and syncing
+against it is the least error-prone way to stay current:
+
+```
+python3 charging.py sync vehicle-2026-monthly.csv           # show the plan
+python3 charging.py sync vehicle-2026-monthly.csv --apply   # write it
+```
+
+It adds months the tracker is missing, corrects any that disagree, normalises
+periods to whole calendar months, and skips a month still in progress -- a
+partial total would otherwise land as a full month and quietly understate the
+next bill. It prints what it would do and writes nothing without `--apply`,
+and refuses outright if the result wouldn't validate.
+
+The export needs a date column and a `kWh` or `MWh` column, one row per month
+dated the 1st. A yearly export is rejected rather than silently misread.
+Past exports are kept in `data/exports/`.
+
+### Catching up on several months by hand
 
 ```
 python3 charging.py import <<EOF
@@ -97,6 +117,20 @@ median — the usual shape of a transposed digit.
 
 `check` exits non-zero if there are errors.
 
+## Where the numbers come from
+
+Readings originally came from the spreadsheet, hand-typed each month from the
+energy monitor. From October 2025 they come from the monitor's export via
+`sync`, and 2025's earlier months have been reconciled against it.
+
+That reconciliation confirmed what the sheet's dates really meant. January,
+February and March 2025 matched the export *exactly* -- including January,
+whose sheet row was labelled `1/4/25 - 2/4/25`. The values were always whole
+calendar months; only the labels were loose. April through September differed
+by a few kWh either way, netting +3.4 kWh over six months ($0.61), and the
+export figures now stand. Normalising those labels also cleared the February
+2025 overlap the migration had preserved.
+
 ## Migrated from the spreadsheet
 
 `scripts/migrate_from_xlsx.py` produced `data/readings.csv` from the original
@@ -109,9 +143,8 @@ for provenance. Two things were changed on the way in:
   but its formulas still produced a $133.09 charge. It's simply absent until a
   reading is entered.
 
-Everything else came across as-is, including the February 2025 overlap that
-`check` reports — that's real data needing a decision, not something to paper
-over.
+Everything else came across as-is, including a February 2025 overlap, which
+was later resolved by the export reconciliation described above.
 
 ### The bug that motivated this
 

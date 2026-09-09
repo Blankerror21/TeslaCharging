@@ -10,6 +10,7 @@ require touching historical data.
   python3 charging.py check            validate the data
   python3 charging.py add ...          append a reading
   python3 charging.py import f.txt     backfill several months at once
+  python3 charging.py sync e.csv       reconcile against a monitor export
 
 Standard library only.
 """
@@ -314,8 +315,9 @@ def validate(readings, rates):
                     f"{current.start} ({at(current)})"
                 )
 
-        # Flag a reading wildly out of line with the meter's own history --
-        # the usual sign of a transposed digit or a missed period.
+        # Flag a reading wildly out of line with the meter's own history.
+        # High is the usual sign of a transposed digit; low usually means a
+        # partial month got recorded as a whole one.
         rates_per_day = [r.kwh / r.days for r in group if r.days > 0 and r.kwh > 0]
         if len(rates_per_day) >= 4:
             typical = median(rates_per_day)
@@ -324,10 +326,12 @@ def validate(readings, rates):
                     if reading.days <= 0 or reading.kwh <= 0:
                         continue
                     daily = reading.kwh / reading.days
-                    if daily > typical * OUTLIER_FACTOR:
+                    if daily > typical * OUTLIER_FACTOR or daily < typical / OUTLIER_FACTOR:
+                        direction = "high" if daily > typical else "low"
                         warnings.append(
                             f"{meter}: {reading.start}..{reading.end} ({at(reading)}) "
-                            f"averages {daily:.1f} kWh/day vs a typical {typical:.1f}"
+                            f"averages {daily:.1f} kWh/day, {direction} against a "
+                            f"typical {typical:.1f}"
                         )
 
     return errors, warnings
@@ -530,6 +534,148 @@ def parse_backfill(lines, default_meter=DEFAULT_METER):
     return parsed
 
 
+def write_readings(readings, path=None):
+    """Rewrite readings.csv from scratch, sorted."""
+    path = path or READINGS_CSV
+    ordered = sorted(readings, key=lambda r: (r.start, r.end, r.meter))
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(["start", "end", "meter", "kwh", "note"])
+        for r in ordered:
+            writer.writerow([r.start.isoformat(), r.end.isoformat(), r.meter,
+                             f"{r.kwh:g}", r.note])
+
+
+def parse_export(lines):
+    """Parse a monitor export: a date column and a kWh or MWh column.
+
+    Rows are timestamped at the start of the period they cover, so a row
+    dated 2025-10-01 in a monthly export is October's total. Returns
+    {(year, month): kwh}.
+    """
+    rows = list(csv.reader(lines))
+    if not rows:
+        raise DataError("export is empty")
+    header = [h.strip() for h in rows[0]]
+    if len(header) < 2:
+        raise DataError(f"expected two columns, got {header}")
+
+    unit = header[1].lower()
+    if "mwh" in unit:
+        scale = 1000.0
+    elif "kwh" in unit:
+        scale = 1.0
+    else:
+        raise DataError(f"can't tell the unit from column heading {header[1]!r}")
+
+    monthly = {}
+    for number, row in enumerate(rows[1:], start=2):
+        if not any(cell.strip() for cell in row):
+            continue
+        try:
+            stamp = date.fromisoformat(row[0].strip()[:10])
+            value = float(row[1]) * scale
+        except (IndexError, ValueError):
+            raise DataError(f"line {number}: can't read {row!r}") from None
+        if stamp.day != 1:
+            raise DataError(
+                f"line {number}: {stamp} isn't the first of a month -- this "
+                f"looks like a daily or yearly export, not a monthly one"
+            )
+        monthly[(stamp.year, stamp.month)] = value
+    if not monthly:
+        raise DataError("export has no data rows")
+    return monthly
+
+
+def plan_sync(monthly, readings, meter, today=None):
+    """Work out what syncing an export would change.
+
+    Returns (adds, updates, unchanged, skipped). A month still in progress is
+    skipped -- its total is partial and would read as a low outlier.
+    """
+    today = today or date.today()
+    existing = {}
+    for reading in readings:
+        if reading.meter == meter:
+            existing.setdefault(billing_month(reading), []).append(reading)
+
+    adds, updates, unchanged, skipped = [], [], [], []
+    for key in sorted(monthly):
+        start, end = month_bounds(f"{key[0]}-{key[1]:02d}")
+        kwh = monthly[key]
+        if end >= today:
+            skipped.append((key, kwh))
+            continue
+        current = existing.get(key)
+        if not current:
+            adds.append(Reading(start, end, meter, kwh))
+        elif len(current) > 1:
+            raise DataError(
+                f"{key[0]}-{key[1]:02d} has {len(current)} {meter} readings; "
+                f"resolve that by hand before syncing"
+            )
+        else:
+            was = current[0]
+            if abs(was.kwh - kwh) < 0.05 and (was.start, was.end) == (start, end):
+                unchanged.append(was)
+            else:
+                updates.append((was, Reading(start, end, meter, kwh, was.note)))
+    return adds, updates, unchanged, skipped
+
+
+def cmd_sync(args, readings, rates):
+    """Reconcile readings against a monthly export from the energy monitor."""
+    with open(args.file) as handle:
+        lines = handle.readlines()
+    try:
+        monthly = parse_export(lines)
+        adds, updates, unchanged, skipped = plan_sync(monthly, readings, args.meter)
+    except DataError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    for key, kwh in skipped:
+        print(f"  skip    {key[0]}-{key[1]:02d}  {kwh:>8,.1f} kWh  (month still in progress)")
+    for was, now in updates:
+        delta = now.kwh - was.kwh
+        moved = "" if (was.start, was.end) == (now.start, now.end) else \
+                f"  [{was.start}..{was.end} -> calendar month]"
+        print(f"  update  {now.start:%Y-%m}  {was.kwh:>8,.1f} -> {now.kwh:,.1f} kWh "
+              f"({delta:+.1f}){moved}")
+    for reading in adds:
+        print(f"  add     {reading.start:%Y-%m}  {reading.kwh:>8,.1f} kWh  "
+              f"= {money(reading.cost(rates))}")
+    if unchanged:
+        print(f"  {len(unchanged)} month(s) already match.")
+
+    if not adds and not updates:
+        print("\nNothing to change.")
+        return 0
+
+    kept = [r for r in readings if r not in {w for w, _ in updates}]
+    proposed = kept + [n for _, n in updates] + adds
+    errors, _ = validate(proposed, rates)
+    before, _ = validate(readings, rates)
+    introduced = [e for e in errors if e not in before]
+    if introduced:
+        print("\nRefusing to sync -- the result would be invalid:", file=sys.stderr)
+        for error in introduced:
+            print(f"  ERROR {error}", file=sys.stderr)
+        return 1
+
+    if not args.apply:
+        net = sum((n.cost(rates) - w.cost(rates) for w, n in updates), Decimal("0"))
+        net += sum((r.cost(rates) for r in adds), Decimal("0"))
+        print(f"\n{len(adds)} to add, {len(updates)} to update, {money(net)} net change.")
+        print("Nothing written. Re-run with --apply.")
+        return 0
+
+    write_readings(proposed)
+    print(f"\nWrote {len(proposed)} reading(s) to {READINGS_CSV.name}.")
+    return 0
+
+
 def cmd_import(args, readings, rates):
     """Backfill several whole months at once, from a file or stdin."""
     source = open(args.file) if args.file else sys.stdin
@@ -620,6 +766,18 @@ def build_parser():
                      help="meter for lines that don't name one")
     imp.add_argument("--force", action="store_true", help="import even if it breaks validation")
     imp.set_defaults(func=cmd_import)
+
+    sync = sub.add_parser(
+        "sync", help="reconcile against a monthly export from the energy monitor",
+        description="Adds months the tracker is missing and corrects ones that "
+                    "disagree, normalising periods to calendar months. A month "
+                    "still in progress is skipped. Shows the plan and writes "
+                    "nothing unless --apply is given.",
+    )
+    sync.add_argument("file", help="exported CSV: a date column and a kWh/MWh column")
+    sync.add_argument("--meter", choices=METERS, default=DEFAULT_METER)
+    sync.add_argument("--apply", action="store_true", help="actually write the changes")
+    sync.set_defaults(func=cmd_sync)
 
     return parser
 
