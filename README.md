@@ -22,13 +22,31 @@ python3 charging.py check       # validate the data
 ### Recording a month
 
 ```
-python3 charging.py add --start 2025-10-01 --end 2025-10-31 \
-    --meter wall_connector --kwh 610.4
+python3 charging.py add --month 2026-09 --kwh 610.4
 ```
 
-`add` refuses to write a reading that would overlap or duplicate an existing
-one for the same meter, so a mistyped date gets caught at entry rather than
-showing up as a wrong bill later. `--force` overrides it. Editing
+That's the whole monthly ritual. `--meter` defaults to `wall_connector`, the
+only meter still running; `--month` expands to the first and last day of that
+month. For a period that isn't a calendar month, use `--start` and `--end`.
+
+### Catching up on several months
+
+```
+python3 charging.py import <<EOF
+2025-10  610.4
+2025-11  588.1
+2025-12  655.2
+EOF
+```
+
+One `YYYY-MM  kwh  [meter]` line per month, from a file or stdin. Blank lines
+and `#` comments are ignored, and it's tolerant about how you paste — tabs,
+commas, or thousands separators (`1,610.4`) all work.
+
+Both commands refuse to write a reading that would overlap or duplicate an
+existing one for the same meter, so a mistyped date is caught at entry rather
+than showing up as a wrong bill later. `import` validates the whole batch
+first and writes nothing if any line is bad. `--force` overrides. Editing
 `data/readings.csv` by hand is fine too — `check` is the safety net either way.
 
 ## Data
@@ -39,7 +57,7 @@ showing up as a wrong bill later. `--force` overrides it. Editing
 | ------- | ---------------------------------------------------------- |
 | `start` | first day of the period, `YYYY-MM-DD`                      |
 | `end`   | last day, inclusive                                        |
-| `meter` | `meter_120v`, `meter_240v`, or `wall_connector`            |
+| `meter` | `meter_120v`, `meter_240v`, or `wall_connector` (below)    |
 | `kwh`   | kWh used over the period                                   |
 | `note`  | free text, optional                                        |
 
@@ -50,6 +68,15 @@ is expected and not an error.
 **`data/rates.csv`** — `effective_from,usd_per_kwh,note`, one row per rate
 change. A period is billed at the rate in effect on its **end** date, the day
 the meter is read. When the rate changes, add a row; don't edit history.
+
+**The three meters:**
+
+- `wall_connector` — the Tesla Wall Connector. The only one still running,
+  and the default for `add` and `import`.
+- `meter_120v` — the crypto mining rig. Shut off in March 2025 once the power
+  cost more than the mining earned; the readings stop there.
+- `meter_240v` — recorded over the same months as the mining rig, ending
+  March 2025. See the open question below.
 
 To track a new circuit, add its name to `METERS` in `charging.py`.
 
@@ -104,17 +131,27 @@ itself:
 `tests/test_charging.py` locks in those four figures, and asserts the months
 the sheet got right still come out unchanged.
 
-## Open question: are the meters additive?
+## Open question: what was `meter_240v` measuring?
 
-`summary` currently adds all three meters together, which is what the sheet's
-total column was reaching for. That is only correct if they measure separate
-circuits. For June 2024 `meter_240v` reads 1,273.7 kWh while `wall_connector`
-reads 791.9 — if those are the same circuit counted two ways, every total
-before March 2025 is inflated and the real number is one meter's alone.
+`summary` adds all three meters together, which is what the sheet's total
+column was reaching for. That's right if they're separate circuits, and wrong
+if any two overlap.
 
-Until that's settled, `summary` prints a per-meter breakdown so both readings
-of the data are visible, and `--meter` restricts the total to whichever meters
-actually count.
+`meter_120v` was the mining rig and `wall_connector` is the car, so those two
+are safely additive. `meter_240v` is the unresolved one: it ran over exactly
+the same months as the mining rig and stopped with it, which suggests it was
+the rig's 240v leg. But for June 2024 it reads 1,273.7 kWh against the wall
+connector's 791.9 — if it was instead a whole-circuit meter that already
+included the car, every total before March 2025 is inflated.
+
+Nothing after March 2025 is affected either way; the car is the only load
+still metered. Until it's settled, `summary` prints a per-meter breakdown so
+both readings are visible, and `--meter` restricts the total to whichever
+meters actually count:
+
+```
+python3 charging.py summary --meter wall_connector    # car only
+```
 
 ## Tests
 

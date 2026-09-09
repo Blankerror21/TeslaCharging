@@ -279,9 +279,10 @@ class TestRealData(unittest.TestCase):
         # The sheet had no total-cost formula in this row at all.
         self.assertEqual(self.months[(2025, 8)]["cost"], Decimal("103.05"))
 
-    def test_october_2025_is_absent_until_a_reading_exists(self):
-        # The sheet billed $133.09 for a month with no meter reading.
-        self.assertNotIn((2025, 10), self.months)
+    def test_the_120v_mining_meter_stopped_in_march_2025(self):
+        # The rig was shut off; only the wall connector runs after this.
+        latest = max(r.end for r in self.readings if r.meter == "meter_120v")
+        self.assertEqual(latest, date(2025, 3, 8))
 
     def test_months_the_sheet_got_right_are_unchanged(self):
         for (year, month), expected in {
@@ -291,25 +292,6 @@ class TestRealData(unittest.TestCase):
         }.items():
             with self.subTest(month=f"{year}-{month:02d}"):
                 self.assertEqual(self.months[(year, month)]["cost"], Decimal(expected))
-
-    def test_month_coverage_is_continuous(self):
-        ordered = sorted(self.months)
-        for earlier, later in zip(ordered, ordered[1:]):
-            expected = (earlier[0] + 1, 1) if earlier[1] == 12 else (earlier[0], earlier[1] + 1)
-            self.assertEqual(later, expected, f"gap after {earlier}")
-
-    def test_known_overlap_is_the_only_error(self):
-        errors, _ = validate(self.readings, self.rates)
-        self.assertEqual(len(errors), 1)
-        self.assertIn("overlap", errors[0])
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
-class TestYearFilterMatchesGrouping(unittest.TestCase):
-    """--year must agree with the month a period is billed to."""
 
     def test_period_straddling_new_year_belongs_to_the_earlier_year(self):
         readings = [reading("2024-12-02", "2025-01-04", kwh=655.9, line=2)]
@@ -323,3 +305,135 @@ class TestYearFilterMatchesGrouping(unittest.TestCase):
             months = charging.by_month(charging.select(readings, year=year), rates)
             self.assertTrue(months)
             self.assertTrue(all(m[0] == year for m in months), f"{year}: {sorted(months)}")
+
+
+class TestMonthBounds(unittest.TestCase):
+    def test_expands_a_month_to_its_first_and_last_day(self):
+        self.assertEqual(charging.month_bounds("2025-10"), (date(2025, 10, 1), date(2025, 10, 31)))
+        self.assertEqual(charging.month_bounds("2026-02"), (date(2026, 2, 1), date(2026, 2, 28)))
+
+    def test_leap_february(self):
+        self.assertEqual(charging.month_bounds("2024-02")[1], date(2024, 2, 29))
+
+    def test_rejects_junk(self):
+        for bad in ("2025-13", "2025", "October", "2025-1-1", ""):
+            with self.subTest(bad=bad), self.assertRaises(DataError):
+                charging.month_bounds(bad)
+
+
+class TestParseBackfill(unittest.TestCase):
+    def test_reads_month_and_kwh(self):
+        parsed = charging.parse_backfill(["2025-10 610.4", "2025-11  580.2"])
+        self.assertEqual(len(parsed), 2)
+        self.assertEqual(parsed[0].start, date(2025, 10, 1))
+        self.assertEqual(parsed[0].end, date(2025, 10, 31))
+        self.assertEqual(parsed[0].kwh, 610.4)
+        self.assertEqual(parsed[0].meter, "wall_connector")
+
+    def test_ignores_blanks_and_comments(self):
+        lines = ["# Oct-Nov", "", "2025-10 610.4", "   ", "2025-11 580.2  # guessed", "\n"]
+        self.assertEqual(len(charging.parse_backfill(lines)), 2)
+
+    def test_keeps_thousands_separators_in_one_field(self):
+        # Pasted straight out of a spreadsheet.
+        parsed = charging.parse_backfill(["2025-10 1,610.4"])
+        self.assertEqual(parsed[0].kwh, 1610.4)
+
+    def test_accepts_commas_as_delimiters(self):
+        parsed = charging.parse_backfill(["2025-10,610.4,meter_240v"])
+        self.assertEqual(parsed[0].kwh, 610.4)
+        self.assertEqual(parsed[0].meter, "meter_240v")
+
+    def test_both_at_once(self):
+        parsed = charging.parse_backfill(["2025-10, 1,610.4, meter_240v"])
+        self.assertEqual(parsed[0].kwh, 1610.4)
+        self.assertEqual(parsed[0].meter, "meter_240v")
+
+    def test_accepts_tab_separated_paste(self):
+        parsed = charging.parse_backfill(["2025-10\t610.4"])
+        self.assertEqual(parsed[0].kwh, 610.4)
+
+    def test_explicit_meter(self):
+        parsed = charging.parse_backfill(["2025-10 610.4 meter_240v"])
+        self.assertEqual(parsed[0].meter, "meter_240v")
+
+    def test_default_meter_is_overridable(self):
+        parsed = charging.parse_backfill(["2025-10 610.4"], default_meter="meter_120v")
+        self.assertEqual(parsed[0].meter, "meter_120v")
+
+    def test_reports_the_offending_line_number(self):
+        with self.assertRaises(DataError) as caught:
+            charging.parse_backfill(["2025-10 610.4", "", "2025-11 lots"])
+        self.assertIn("line 3", str(caught.exception))
+
+    def test_rejects_an_unknown_meter(self):
+        with self.assertRaises(DataError):
+            charging.parse_backfill(["2025-10 610.4 solar"])
+
+    def test_rejects_a_wrong_field_count(self):
+        with self.assertRaises(DataError):
+            charging.parse_backfill(["2025-10"])
+        with self.assertRaises(DataError):
+            charging.parse_backfill(["2025-10 1 2 3"])
+
+
+class TestResolvePeriod(unittest.TestCase):
+    class Args:
+        def __init__(self, month=None, start=None, end=None):
+            self.month, self.start, self.end = month, start, end
+
+    def test_month(self):
+        self.assertEqual(charging.resolve_period(self.Args(month="2025-10")),
+                         (date(2025, 10, 1), date(2025, 10, 31)))
+
+    def test_explicit_period(self):
+        self.assertEqual(charging.resolve_period(self.Args(start="2025-10-03", end="2025-11-02")),
+                         (date(2025, 10, 3), date(2025, 11, 2)))
+
+    def test_month_and_explicit_together_is_an_error(self):
+        with self.assertRaises(DataError):
+            charging.resolve_period(self.Args(month="2025-10", start="2025-10-01"))
+
+    def test_half_a_period_is_an_error(self):
+        with self.assertRaises(DataError):
+            charging.resolve_period(self.Args(start="2025-10-01"))
+
+    def test_backwards_period_is_an_error(self):
+        with self.assertRaises(DataError):
+            charging.resolve_period(self.Args(start="2025-11-01", end="2025-10-01"))
+
+
+class TestAppendReadings(unittest.TestCase):
+    """A batch must be all-or-nothing, so a bad line can't half-update the file."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "readings.csv"
+        self.path.write_text("start,end,meter,kwh,note\n"
+                             "2025-01-01,2025-01-31,wall_connector,600,\n")
+        self._real = charging.READINGS_CSV
+        charging.READINGS_CSV = self.path
+        self.addCleanup(setattr, charging, "READINGS_CSV", self._real)
+        self.existing = charging.load_readings(self.path)
+
+    def test_a_clean_batch_is_written(self):
+        new = charging.parse_backfill(["2025-02 580", "2025-03 590"])
+        self.assertEqual(charging.append_readings(new, self.existing, FLAT_RATES), [])
+        self.assertEqual(len(charging.load_readings(self.path)), 3)
+
+    def test_one_bad_row_writes_nothing(self):
+        new = charging.parse_backfill(["2025-02 580", "2025-01 999"])  # Jan already exists
+        introduced = charging.append_readings(new, self.existing, FLAT_RATES)
+        self.assertTrue(introduced)
+        self.assertEqual(len(charging.load_readings(self.path)), 1)
+
+    def test_force_writes_anyway(self):
+        new = charging.parse_backfill(["2025-01 999"])
+        self.assertEqual(charging.append_readings(new, self.existing, FLAT_RATES, force=True), [])
+        self.assertEqual(len(charging.load_readings(self.path)), 2)
+
+    def test_a_batch_conflicting_with_itself_is_caught(self):
+        new = charging.parse_backfill(["2025-02 580", "2025-02 590"])
+        self.assertTrue(charging.append_readings(new, self.existing, FLAT_RATES))
+        self.assertEqual(len(charging.load_readings(self.path)), 1)

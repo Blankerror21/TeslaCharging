@@ -9,11 +9,13 @@ require touching historical data.
   python3 charging.py report           every reading, with cost
   python3 charging.py check            validate the data
   python3 charging.py add ...          append a reading
+  python3 charging.py import f.txt     backfill several months at once
 
 Standard library only.
 """
 
 import argparse
+import calendar
 import csv
 import os
 import sys
@@ -28,13 +30,31 @@ RATES_CSV = DATA_DIR / "rates.csv"
 
 # Every meter that can appear in readings.csv. Adding one here is the only
 # step needed to start tracking a new circuit.
+#
+#   meter_120v      the crypto mining rig, shut off in March 2025
+#   meter_240v      recorded alongside it over the same months
+#   wall_connector  the Tesla Wall Connector -- the only live meter
 METERS = ("meter_120v", "meter_240v", "wall_connector")
 
 CENT = Decimal("0.01")
 
 
+# The meter still in use. Mining is shut off, so this is what a bare
+# `add` or `import` means unless told otherwise.
+DEFAULT_METER = "wall_connector"
+
+
 class DataError(Exception):
     """Raised when readings.csv or rates.csv cannot be interpreted at all."""
+
+
+def month_bounds(text):
+    """'2025-10' -> (2025-10-01, 2025-10-31)."""
+    try:
+        year, month = (int(part) for part in text.strip().split("-"))
+        return date(year, month, 1), date(year, month, calendar.monthrange(year, month)[1])
+    except (ValueError, TypeError, calendar.IllegalMonthError):
+        raise DataError(f"{text!r} is not a YYYY-MM month") from None
 
 
 # --------------------------------------------------------------------------
@@ -423,35 +443,124 @@ def cmd_check(args, readings, rates):
     return 1 if errors else 0
 
 
-def cmd_add(args, readings, rates):
-    start = date.fromisoformat(args.start)
-    end = date.fromisoformat(args.end)
+def append_readings(new, readings, rates, force=False):
+    """Validate `new` against existing readings, then append them together.
+
+    Nothing is written unless the whole batch is clean, so a bad line in a
+    backfill can't leave the file half-updated.
+    """
+    before, _ = validate(readings, rates)
+    after, _ = validate(readings + new, rates)
+    introduced = [e for e in after if e not in before]
+    if introduced and not force:
+        return introduced
+
+    with READINGS_CSV.open("a", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        for reading in new:
+            writer.writerow([
+                reading.start.isoformat(), reading.end.isoformat(),
+                reading.meter, f"{reading.kwh:g}", reading.note,
+            ])
+    return []
+
+
+def resolve_period(args):
+    """Period from either --month or --start/--end."""
+    if args.month:
+        if args.start or args.end:
+            raise DataError("use --month or --start/--end, not both")
+        return month_bounds(args.month)
+    if not (args.start and args.end):
+        raise DataError("give --month YYYY-MM, or both --start and --end")
+    try:
+        start, end = date.fromisoformat(args.start), date.fromisoformat(args.end)
+    except ValueError as exc:
+        raise DataError(str(exc)) from None
     if end < start:
-        print(f"end {end} is before start {start}", file=sys.stderr)
-        return 2
-    if args.meter not in METERS:
-        print(f"unknown meter {args.meter!r}; expected one of {', '.join(METERS)}", file=sys.stderr)
+        raise DataError(f"end {end} is before start {start}")
+    return start, end
+
+
+def cmd_add(args, readings, rates):
+    try:
+        start, end = resolve_period(args)
+    except DataError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
 
     new = Reading(start, end, args.meter, args.kwh, args.note or "")
-    errors, _ = validate(readings + [new], rates)
-    before, _ = validate(readings, rates)
-    introduced = [e for e in errors if e not in before]
-    if introduced and not args.force:
+    introduced = append_readings([new], readings, rates, args.force)
+    if introduced:
         print("Refusing to add -- this reading would break the data:", file=sys.stderr)
         for error in introduced:
             print(f"  ERROR {error}", file=sys.stderr)
         print("Re-run with --force to add it anyway.", file=sys.stderr)
         return 1
 
-    with READINGS_CSV.open("a", newline="") as handle:
-        csv.writer(handle, lineterminator="\n").writerow(
-            [start.isoformat(), end.isoformat(), args.meter, f"{args.kwh:g}", args.note or ""]
-        )
-
     print(f"Added {start}..{end} {args.meter} {args.kwh:g} kWh = {money(new.cost(rates))}")
+    return 0
+
+
+def parse_backfill(lines, default_meter=DEFAULT_METER):
+    """Parse `YYYY-MM  kwh  [meter]` lines. Blank lines and # comments ignored."""
+    parsed = []
+    for number, raw in enumerate(lines, start=1):
+        text = raw.split("#", 1)[0].strip()
+        if not text:
+            continue
+        # Fields are whitespace-separated. A line with no whitespace at all
+        # is treated as comma-separated, so a row pasted from a CSV export
+        # works too. Any comma left inside a field is a thousands separator.
+        fields = text.split()
+        if len(fields) == 1 and "," in fields[0]:
+            fields = fields[0].split(",")
+        fields = [field for field in (f.replace(",", "").strip() for f in fields) if field]
+        if len(fields) not in (2, 3):
+            raise DataError(f"line {number}: expected 'YYYY-MM kwh [meter]', got {text!r}")
+        start, end = month_bounds(fields[0])
+        try:
+            kwh = float(fields[1])
+        except ValueError:
+            raise DataError(f"line {number}: {fields[1]!r} is not a number") from None
+        meter = fields[2] if len(fields) == 3 else default_meter
+        if meter not in METERS:
+            raise DataError(f"line {number}: unknown meter {meter!r}")
+        parsed.append(Reading(start, end, meter, kwh))
+    return parsed
+
+
+def cmd_import(args, readings, rates):
+    """Backfill several whole months at once, from a file or stdin."""
+    source = open(args.file) if args.file else sys.stdin
+    try:
+        lines = source.readlines()
+    finally:
+        if args.file:
+            source.close()
+
+    try:
+        new = parse_backfill(lines, args.meter)
+    except DataError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if not new:
+        print("Nothing to import.")
+        return 0
+
+    introduced = append_readings(new, readings, rates, args.force)
     if introduced:
-        print("(added with --force despite errors; run `check`)")
+        print(f"Refusing to import {len(new)} reading(s) -- nothing was written:", file=sys.stderr)
+        for error in introduced:
+            print(f"  ERROR {error}", file=sys.stderr)
+        print("Fix the input, or re-run with --force.", file=sys.stderr)
+        return 1
+
+    total = sum((r.cost(rates) for r in new), Decimal("0"))
+    for reading in new:
+        print(f"  {reading.start}..{reading.end}  {reading.meter:<15} "
+              f"{reading.kwh:>8,.1f} kWh  {money(reading.cost(rates)):>9}")
+    print(f"\nImported {len(new)} reading(s), {money(total)} added.")
     return 0
 
 
@@ -490,14 +599,27 @@ def build_parser():
     check = sub.add_parser("check", help="validate the data")
     check.set_defaults(func=cmd_check)
 
-    add = sub.add_parser("add", help="append a reading")
-    add.add_argument("--start", required=True, metavar="YYYY-MM-DD")
-    add.add_argument("--end", required=True, metavar="YYYY-MM-DD")
-    add.add_argument("--meter", required=True, choices=METERS)
+    add = sub.add_parser("add", help="append one reading")
+    add.add_argument("--month", metavar="YYYY-MM", help="a whole calendar month")
+    add.add_argument("--start", metavar="YYYY-MM-DD", help="or an explicit period")
+    add.add_argument("--end", metavar="YYYY-MM-DD")
+    add.add_argument("--meter", choices=METERS, default=DEFAULT_METER)
     add.add_argument("--kwh", required=True, type=float)
     add.add_argument("--note", default="")
     add.add_argument("--force", action="store_true", help="add even if it breaks validation")
     add.set_defaults(func=cmd_add)
+
+    imp = sub.add_parser(
+        "import", help="backfill whole months from a file or stdin",
+        description="Reads 'YYYY-MM  kwh  [meter]' lines. Blank lines and "
+                    "# comments are ignored. Nothing is written unless every "
+                    "line is valid.",
+    )
+    imp.add_argument("file", nargs="?", help="input file (default: stdin)")
+    imp.add_argument("--meter", choices=METERS, default=DEFAULT_METER,
+                     help="meter for lines that don't name one")
+    imp.add_argument("--force", action="store_true", help="import even if it breaks validation")
+    imp.set_defaults(func=cmd_import)
 
     return parser
 
