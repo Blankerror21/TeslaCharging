@@ -196,10 +196,14 @@ for provenance. Two things were changed on the way in:
   offset the bill. Its `Total` cell was `=J31+J32`, stopping above the leaf
   blower and reading $437.87 against an actual $557.87.
 
-The spreadsheet's own version history dates the leaf blower to **23 October
-2025**; Home Depot and Harbor Freight were already present by then, with no
-closer bound yet. All three therefore precede November 2025, so a balance
-taken from that date carries no purchase credit.
+The spreadsheet's own version history dates all three. The Home Depot and
+Harbor Freight amounts were entered on **13 June 2025** (their labels were
+already there, so the items were noted earlier and priced that day); the leaf
+blower was added on **23 October 2025**. All three precede November 2025, so a
+balance taken from that date carries no purchase credit.
+
+These are the dates the figures were written down, which bound the purchase
+dates without being them.
 
 That same revision is where the total-cost formulas broke. It added the July,
 August and September 2025 readings in one catch-up pass and dragged the
