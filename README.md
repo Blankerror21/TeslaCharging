@@ -131,27 +131,30 @@ itself:
 `tests/test_charging.py` locks in those four figures, and asserts the months
 the sheet got right still come out unchanged.
 
-## Open question: what was `meter_240v` measuring?
+## What each meter was, and how they combine
 
-`summary` adds all three meters together, which is what the sheet's total
-column was reaching for. That's right if they're separate circuits, and wrong
-if any two overlap.
+All three meters are separate loads, so `summary` adds them together for a
+total power bill. `--meter wall_connector` narrows it to car charging alone.
 
-`meter_120v` was the mining rig and `wall_connector` is the car, so those two
-are safely additive. `meter_240v` is the unresolved one: it ran over exactly
-the same months as the mining rig and stopped with it, which suggests it was
-the rig's 240v leg. But for June 2024 it reads 1,273.7 kWh against the wall
-connector's 791.9 — if it was instead a whole-circuit meter that already
-included the car, every total before March 2025 is inflated.
+`meter_240v` was ambiguous for a while -- it ran over exactly the same months
+as the mining rig, but at 1,273.7 kWh for June 2024 against the wall
+connector's 791.9, it could plausibly have been a whole-circuit meter that
+already included the car. A yearly "Vehicle" export from the energy monitor
+settled it:
 
-Nothing after March 2025 is affected either way; the car is the only load
-still metered. Until it's settled, `summary` prints a per-meter breakdown so
-both readings are visible, and `--meter` restricts the total to whichever
-meters actually count:
+| 2024 total            | kWh    | vs. export |
+| --------------------- | ------ | ---------- |
+| Vehicle (export)      |  5,200 | --         |
+| wall_connector        |  5,087 | -113 (2%)  |
+| wall_connector + 240v | 15,328 | +10,128    |
 
-```
-python3 charging.py summary --meter wall_connector    # car only
-```
+The wall connector alone tracks the car's real usage to within 2%, over a year
+where our readings don't even start until May 26. Adding `meter_240v` overshoots
+threefold, so it was not measuring the car. Combined with its dates, it was the
+mining rig's 240v leg.
+
+That 2% also means the car used almost nothing before late May 2024, which is
+where the wall connector readings begin.
 
 ## Tests
 
