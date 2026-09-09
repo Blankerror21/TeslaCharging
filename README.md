@@ -1,2 +1,123 @@
 # TeslaCharging
-Spread Sheet I use to track kWH used for charging per month to pay home owner
+
+Tracks kWh used charging at home, and what's owed to the homeowner for it.
+
+Replaces the `Electric_Usage.xlsx` spreadsheet this started as. Readings live
+in a CSV that diffs cleanly in git; the totals are computed rather than typed,
+so a dragged formula can't quietly bill the wrong month again.
+
+Python 3.9+, standard library only. Nothing to install.
+
+## Usage
+
+```
+python3 charging.py summary     # what's owed, by month
+python3 charging.py report      # every reading, with its cost
+python3 charging.py check       # validate the data
+```
+
+`summary` and `report` take `--year 2025`, `--meter wall_connector` (repeatable),
+`--since YYYY-MM-DD`, and `--until YYYY-MM-DD`.
+
+### Recording a month
+
+```
+python3 charging.py add --start 2025-10-01 --end 2025-10-31 \
+    --meter wall_connector --kwh 610.4
+```
+
+`add` refuses to write a reading that would overlap or duplicate an existing
+one for the same meter, so a mistyped date gets caught at entry rather than
+showing up as a wrong bill later. `--force` overrides it. Editing
+`data/readings.csv` by hand is fine too — `check` is the safety net either way.
+
+## Data
+
+**`data/readings.csv`** — one row per meter per billing period.
+
+| column  | meaning                                                    |
+| ------- | ---------------------------------------------------------- |
+| `start` | first day of the period, `YYYY-MM-DD`                      |
+| `end`   | last day, inclusive                                        |
+| `meter` | `meter_120v`, `meter_240v`, or `wall_connector`            |
+| `kwh`   | kWh used over the period                                   |
+| `note`  | free text, optional                                        |
+
+Two periods on the same meter may share a boundary date — one meter read
+closes a period and opens the next. Different meters covering the same days
+is expected and not an error.
+
+**`data/rates.csv`** — `effective_from,usd_per_kwh,note`, one row per rate
+change. A period is billed at the rate in effect on its **end** date, the day
+the meter is read. When the rate changes, add a row; don't edit history.
+
+To track a new circuit, add its name to `METERS` in `charging.py`.
+
+## How months are assigned
+
+Billing periods don't line up with calendar months. A period is attributed
+whole to whichever month holds most of its days — so `11/1 – 12/2` is a
+November bill and `3/31 – 4/30` an April one. Going by the start or end date
+alone gets one of those two wrong.
+
+## What `check` looks for
+
+Errors (the bill can't be trusted): overlapping or duplicate periods on one
+meter, `end` before `start`, negative kWh, unknown meter name, a period with
+no rate covering it. Warnings (worth a look): gaps in coverage, zero-kWh
+readings, and any period whose kWh/day is more than 3× that meter's own
+median — the usual shape of a transposed digit.
+
+`check` exits non-zero if there are errors.
+
+## Migrated from the spreadsheet
+
+`scripts/migrate_from_xlsx.py` produced `data/readings.csv` from the original
+`Electric_Usage.xlsx` (it needs `openpyxl`; nothing else here does). It's kept
+for provenance. Two things were changed on the way in:
+
+- **Two end-year typos fixed.** Rows 11 and 25 both read `12/x/24 - 1/4/24`,
+  which ends before it starts. Corrected to `2025`.
+- **One empty row dropped.** Row 35 (`10/1/25 - 10/30/25`) had no kWh recorded
+  but its formulas still produced a $133.09 charge. It's simply absent until a
+  reading is entered.
+
+Everything else came across as-is, including the February 2025 overlap that
+`check` reports — that's real data needing a decision, not something to paper
+over.
+
+### The bug that motivated this
+
+In the sheet, the total-cost and total-kWh columns used `=E<n-14>+E<n>`. That
+offset was correct while the upstairs "Electric usage" block had rows to point
+at, but that block stopped in March 2025 while the wall-connector block kept
+going. Past row 31 the reference wrapped back into the wall-connector block
+itself:
+
+| Month    | Sheet showed | Actual  | Because it added         |
+| -------- | ------------ | ------- | ------------------------ |
+| Jul 2025 | $155.61      | $119.39 | 5/26–5/30 **2024**       |
+| Aug 2025 | *(blank)*    | $103.05 | formula missing entirely |
+| Sep 2025 | $258.80      | $108.34 | July **2024**            |
+| Oct 2025 | $133.09      | —       | Aug **2024**; no reading |
+
+`tests/test_charging.py` locks in those four figures, and asserts the months
+the sheet got right still come out unchanged.
+
+## Open question: are the meters additive?
+
+`summary` currently adds all three meters together, which is what the sheet's
+total column was reaching for. That is only correct if they measure separate
+circuits. For June 2024 `meter_240v` reads 1,273.7 kWh while `wall_connector`
+reads 791.9 — if those are the same circuit counted two ways, every total
+before March 2025 is inflated and the real number is one meter's alone.
+
+Until that's settled, `summary` prints a per-meter breakdown so both readings
+of the data are visible, and `--meter` restricts the total to whichever meters
+actually count.
+
+## Tests
+
+```
+python3 -m unittest discover -s tests
+```
