@@ -151,6 +151,14 @@ the monthly rows sum to 7,084.7 kWh against a 7,100 kWh yearly rollup, which
 agrees inside the rollup's rounding. For 2026 they sum to 4,554.1 against
 4,900 -- roughly 346 kWh the monthly breakdown never accounted for.
 
+January 2026 is where that shortfall sits -- 289.4 kWh against a 634 kWh
+median, and the only month in the record more than two standard deviations
+low. The charger was offline for a stretch around then, so its sessions
+likely never reached the monitor's monthly view. **The figure is recorded as
+measured anyway**, at 289.4: it is what the meter actually reports, and a
+reconstructed number is not worth the ambiguity here. If a later export
+backfills those sessions, `sync` will pick the real figure up on its own.
+
 That reconciliation confirmed what the sheet's dates really meant. January,
 February and March 2025 matched the export *exactly* -- including January,
 whose sheet row was labelled `1/4/25 - 2/4/25`. The values were always whole

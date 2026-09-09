@@ -668,3 +668,59 @@ class TestEstimatedReadings(unittest.TestCase):
                             "2026-01-01,2026-01-31,wall_connector,635,\n")
             loaded = charging.load_readings(path)
         self.assertFalse(loaded[0].estimated)
+
+
+class TestReplace(unittest.TestCase):
+    """Revising a month in place, for when a figure turns out to be wrong."""
+
+    class Args:
+        def __init__(self, **kw):
+            defaults = dict(month=None, start=None, end=None, meter="wall_connector",
+                            kwh=0.0, note="", estimated=False, replace=False, force=False)
+            defaults.update(kw)
+            for key, value in defaults.items():
+                setattr(self, key, value)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "readings.csv"
+        charging.write_readings([
+            Reading(date(2026, 1, 1), date(2026, 1, 31), "wall_connector", 289.4),
+            Reading(date(2026, 2, 1), date(2026, 2, 28), "wall_connector", 607.9),
+        ], self.path)
+        real = charging.READINGS_CSV
+        charging.READINGS_CSV = self.path
+        self.addCleanup(setattr, charging, "READINGS_CSV", real)
+        self.readings = charging.load_readings(self.path)
+
+    def test_replaces_in_place_without_duplicating(self):
+        code = charging.cmd_add(
+            self.Args(month="2026-01", kwh=635.3, estimated=True, replace=True),
+            self.readings, FLAT_RATES)
+        self.assertEqual(code, 0)
+        after = charging.load_readings(self.path)
+        self.assertEqual(len(after), 2)
+        january = next(r for r in after if billing_month(r) == (2026, 1))
+        self.assertAlmostEqual(january.kwh, 635.3)
+        self.assertTrue(january.estimated)
+
+    def test_leaves_other_months_alone(self):
+        charging.cmd_add(self.Args(month="2026-01", kwh=635.3, replace=True),
+                         self.readings, FLAT_RATES)
+        after = charging.load_readings(self.path)
+        february = next(r for r in after if billing_month(r) == (2026, 2))
+        self.assertAlmostEqual(february.kwh, 607.9)
+        self.assertFalse(february.estimated)
+
+    def test_replacing_a_month_with_no_reading_is_refused(self):
+        code = charging.cmd_add(self.Args(month="2026-05", kwh=600.0, replace=True),
+                                self.readings, FLAT_RATES)
+        self.assertEqual(code, 2)
+        self.assertEqual(len(charging.load_readings(self.path)), 2)
+
+    def test_without_replace_a_duplicate_month_is_refused(self):
+        code = charging.cmd_add(self.Args(month="2026-01", kwh=635.3),
+                                self.readings, FLAT_RATES)
+        self.assertEqual(code, 1)
+        self.assertEqual(len(charging.load_readings(self.path)), 2)

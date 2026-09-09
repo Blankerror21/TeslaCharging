@@ -511,15 +511,41 @@ def cmd_add(args, readings, rates):
         return 2
 
     new = Reading(start, end, args.meter, args.kwh, args.note or "", args.estimated)
-    introduced = append_readings([new], readings, rates, args.force)
-    if introduced:
-        print("Refusing to add -- this reading would break the data:", file=sys.stderr)
-        for error in introduced:
-            print(f"  ERROR {error}", file=sys.stderr)
-        print("Re-run with --force to add it anyway.", file=sys.stderr)
-        return 1
 
-    print(f"Added {start}..{end} {args.meter} {args.kwh:g} kWh = {money(new.cost(rates))}")
+    if args.replace:
+        key = billing_month(new)
+        superseded = [r for r in readings
+                      if r.meter == new.meter and billing_month(r) == key]
+        if not superseded:
+            print(f"error: nothing to replace for {key[0]}-{key[1]:02d} {new.meter}; "
+                  f"drop --replace to add it", file=sys.stderr)
+            return 2
+        kept = [r for r in readings if r not in superseded]
+        errors, _ = validate(kept + [new], rates)
+        before, _ = validate(readings, rates)
+        introduced = [e for e in errors if e not in before]
+        if introduced and not args.force:
+            print("Refusing to replace -- the result would be invalid:", file=sys.stderr)
+            for error in introduced:
+                print(f"  ERROR {error}", file=sys.stderr)
+            return 1
+        for was in superseded:
+            print(f"Replaced {was.start}..{was.end} {was.meter} {was.kwh:g} kWh "
+                  f"({money(was.cost(rates))})")
+        write_readings(kept + [new])
+    else:
+        introduced = append_readings([new], readings, rates, args.force)
+        if introduced:
+            print("Refusing to add -- this reading would break the data:", file=sys.stderr)
+            for error in introduced:
+                print(f"  ERROR {error}", file=sys.stderr)
+            print("Re-run with --force to add it anyway.", file=sys.stderr)
+            return 1
+
+    verb = "Set" if args.replace else "Added"
+    tag = " (estimated)" if new.estimated else ""
+    print(f"{verb} {start}..{end} {args.meter} {args.kwh:g} kWh "
+          f"= {money(new.cost(rates))}{tag}")
     return 0
 
 
@@ -780,6 +806,8 @@ def build_parser():
     add.add_argument("--note", default="")
     add.add_argument("--estimated", action="store_true",
                      help="mark as reconstructed rather than metered")
+    add.add_argument("--replace", action="store_true",
+                     help="overwrite the existing reading for that month and meter")
     add.add_argument("--force", action="store_true", help="add even if it breaks validation")
     add.set_defaults(func=cmd_add)
 
